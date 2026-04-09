@@ -1,0 +1,6 @@
+@PandaRuleEngineApi_HostAddress = http://localhost:5055
+
+GET {{PandaRuleEngineApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
