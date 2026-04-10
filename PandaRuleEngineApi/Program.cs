@@ -13,14 +13,19 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<SessionStore>();
 builder.Services.AddSingleton<IUnitConverter, AviationUnitConverter>();
 
-// Register Orchestrators
+// ==========================================
+// REGISTER PIPELINES
+// ==========================================
+
+// 1. NAV Module Registration
 builder.Services.AddSingleton<StateOrchestrator<NavInputs>>();
-
-// Register Mutators (Input Changing Logic)
 builder.Services.AddSingleton<IFieldMutator<NavInputs>, DistanceMutator>();
-
-// Register Solvers (Engineering Math Logic)
 builder.Services.AddSingleton<IDomainSolver<NavInputs>, DistanceSolver>();
+
+// 2. OCS Module Registration (NEW)
+builder.Services.AddSingleton<StateOrchestrator<OcsInputs>>();
+builder.Services.AddSingleton<IFieldMutator<OcsInputs>, CategoryMutator>();
+builder.Services.AddSingleton<IDomainSolver<OcsInputs>, OcsCategorySolver>();
 
 var app = builder.Build();
 
@@ -32,8 +37,15 @@ app.MapPost("/api/nav/evaluate", (EvaluateRequest request, StateOrchestrator<Nav
 {
     var state = store.GetNavState(request.SessionId);
     var result = orchestrator.Execute(state, request.Trigger, request.NewValue, request.SolveTargets);
-    //converting result to needed units here too via some service
-    return Results.Ok(new PandaResponse<NavInputs>(result));
+    return Results.Ok(new SampleResponse<NavInputs>(result));
+});
+
+// NEW ENDPOINT for OCS
+app.MapPost("/api/ocs/evaluate", (EvaluateRequest request, StateOrchestrator<OcsInputs> orchestrator, SessionStore store) =>
+{
+    var state = store.GetOcsState(request.SessionId);
+    var result = orchestrator.Execute(state, request.Trigger, request.NewValue, request.SolveTargets);
+    return Results.Ok(new SampleResponse<OcsInputs>(result));
 });
 
 app.Run();
@@ -50,11 +62,11 @@ public class EvaluateRequest
     public List<string> SolveTargets { get; set; } = new();
 }
 
-public class PandaResponse<T> where T : IPandaModule
+public class SampleResponse<T> where T : IPandaModule
 {
     public T Inputs { get; }
     public Dictionary<string, FieldMetadata> Metadata { get; }
-    public PandaResponse(T state) { Inputs = state; Metadata = state.Metadata; }
+    public SampleResponse(T state) { Inputs = state; Metadata = state.Metadata; }
 }
 
 public class FieldMetadata
@@ -81,23 +93,18 @@ public static class PandaModuleExtensions
     }
 }
 
-// THE NEW DECOUPLED CONTRACTS
-
-// 1. Handles ONLY data extraction, conversion, and applying the new value.
 public interface IFieldMutator<T> where T : IPandaModule
 {
     string TargetField { get; }
     bool TryMutate(T state, object rawValue);
 }
 
-// 2. Handles ONLY the mathematical side-effects.
 public interface IDomainSolver<T> where T : IPandaModule
 {
     string TriggerField { get; }
     void Solve(T state, List<string> solveTargets);
 }
 
-// THE COORDINATOR
 public class StateOrchestrator<T> where T : class, IPandaModule
 {
     private readonly IEnumerable<IFieldMutator<T>> _mutators;
@@ -113,15 +120,12 @@ public class StateOrchestrator<T> where T : class, IPandaModule
     {
         state.ResetMetadata();
 
-        // 1. Find the mutator for this specific field
         var mutator = _mutators.FirstOrDefault(m => m.TargetField == trigger);
 
         if (mutator != null)
         {
-            // 2. Attempt to mutate. If it fails (e.g., bad data), stop the pipeline.
             bool success = mutator.TryMutate(state, newValue);
 
-            // 3. If mutation succeeded, find and run all mathematical solvers tied to this trigger
             if (success)
             {
                 var solvers = _solvers.Where(s => s.TriggerField == trigger);
@@ -143,7 +147,10 @@ public class StateOrchestrator<T> where T : class, IPandaModule
 public class SessionStore
 {
     private readonly ConcurrentDictionary<string, NavInputs> _navSessions = new();
+    private readonly ConcurrentDictionary<string, OcsInputs> _ocsSessions = new(); // NEW
+
     public NavInputs GetNavState(string sessionId) => _navSessions.GetOrAdd(sessionId, _ => new NavInputs());
+    public OcsInputs GetOcsState(string sessionId) => _ocsSessions.GetOrAdd(sessionId, _ => new OcsInputs()); // NEW
 }
 
 public interface IUnitConverter { double ConvertFeetToMeters(double feet); }
@@ -170,47 +177,39 @@ public class NavInputs : IPandaModule
     }
 }
 
-// --- RESPONSIBILITY 1: INPUT CHANGING (THE MUTATOR) ---
 public class DistanceMutator : IFieldMutator<NavInputs>
 {
     private readonly IUnitConverter _unitConverter;
-
     public DistanceMutator(IUnitConverter unitConverter) => _unitConverter = unitConverter;
-
     public string TargetField => nameof(NavInputs.Distance);
 
     public bool TryMutate(NavInputs state, object rawValue)
     {
-        // 1. Extraction
         if (rawValue is not JsonElement jsonElement || !jsonElement.TryGetDouble(out double newDistance))
         {
             state.Metadata[TargetField].Warning = "Invalid numeric input.";
-            return false; // Stop pipeline
+            return false;
         }
+        
+        //here we can add our converters and etc. 
 
-        // 2. Validation
         if (newDistance <= 0)
         {
             state.Metadata[TargetField].Warning = "Distance must be greater than zero.";
-            return false; // Stop pipeline
+            return false; 
         }
-
-        // 3. Conversion & Mutation
-        //state.Distance = _unitConverter.ConvertFeetToMeters(newDistance);
+        
         state.Distance = newDistance;
-        return true; // Proceed to solvers
+        return true; 
     }
 }
 
-// --- RESPONSIBILITY 2: DOMAIN MATH (THE SOLVER) ---
 public class DistanceSolver : IDomainSolver<NavInputs>
 {
-    // This solver listens for changes to Distance
     public string TriggerField => nameof(NavInputs.Distance);
 
     public void Solve(NavInputs state, List<string> solveTargets)
     {
-        // Notice how clean this is. No JSON parsing, no validation. Just engineering math.
         bool solveGradient = solveTargets.Contains(nameof(state.Gradient));
 
         if (solveGradient)
@@ -222,6 +221,75 @@ public class DistanceSolver : IDomainSolver<NavInputs>
         {
             state.Altitude = state.Distance * state.Gradient;
             state.Metadata[nameof(state.Altitude)].Warning = "Recalculated to maintain constraints.";
+        }
+    }
+}
+
+// =========================================================================
+// 5. OCS MODULE IMPLEMENTATION (NEW 1-TO-1 EXAMPLE)
+// =========================================================================
+
+public class OcsInputs : IPandaModule
+{
+    public string Category { get; set; } = "CAT_I";
+    public double Slope { get; set; } = 0.02;
+
+    [JsonIgnore]
+    public Dictionary<string, FieldMetadata> Metadata { get; } = new();
+
+    public OcsInputs() => this.InitMetadata();
+
+    public void ResetMetadata()
+    {
+        foreach (var meta in Metadata.Values) { meta.IsReadOnly = false; meta.Warning = null; }
+    }
+}
+
+// --- OCS MUTATOR ---
+public class CategoryMutator : IFieldMutator<OcsInputs>
+{
+    public string TargetField => nameof(OcsInputs.Category);
+
+    public bool TryMutate(OcsInputs state, object rawValue)
+    {
+        // 1. Extraction: Safely parse a string out of the JSON element
+        if (rawValue is not JsonElement jsonElement || jsonElement.ValueKind != JsonValueKind.String)
+        {
+            state.Metadata[TargetField].Warning = "Category must be text.";
+            return false;
+        }
+
+        string newCategory = jsonElement.GetString()!.ToUpper();
+
+        // 2. Validation: Ensure it's a valid aviation category
+        if (newCategory != "CAT_I" && newCategory != "CAT_II")
+        {
+            state.Metadata[TargetField].Warning = "Invalid aircraft category.";
+            return false;
+        }
+
+        // 3. Mutation
+        state.Category = newCategory;
+        return true;
+    }
+}
+
+// --- OCS SOLVER ---
+public class OcsCategorySolver : IDomainSolver<OcsInputs>
+{
+    public string TriggerField => nameof(OcsInputs.Category);
+
+    public void Solve(OcsInputs state, List<string> solveTargets)
+    {
+        if (state.Category == "CAT_II")
+        {
+            state.Slope = 0.025;
+            state.Metadata[nameof(state.Slope)].IsReadOnly = true; // Lock the field in the UI
+            state.Metadata[nameof(state.Slope)].Warning = "Slope locked by CAT II regulation.";
+        }
+        else 
+        {
+            state.Slope = 0.02;
         }
     }
 }
